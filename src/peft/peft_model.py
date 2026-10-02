@@ -213,6 +213,14 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         return self.base_model.peft_config
 
     @property
+    def _active_adapter_name(self) -> str:
+        # When multiple adapters are active, config lookups fall back to the first active adapter.
+        active_adapter = self.active_adapter
+        if isinstance(active_adapter, list):
+            active_adapter = active_adapter[0]
+        return active_adapter
+
+    @property
     def active_adapters(self) -> list[str]:
         try:
             adapters = self.base_model.active_adapters
@@ -237,7 +245,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         are no active adapters (enabled but inactive). They are two separate mechanisms but sometimes it is helpful to
         know whether the model has any active/enabled adapter at all.
         """
-        if self.peft_config[self.active_adapter].is_prompt_learning:
+        if self.peft_config[self._active_adapter_name].is_prompt_learning:
             return not self._adapters_disabled
 
         return not self._adapters_disabled or not self.active_adapters
@@ -1046,7 +1054,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         ```
         """
         was_disabled = self._adapters_disabled
-        if self.peft_config[self.active_adapter].is_prompt_learning:
+        if self.peft_config[self._active_adapter_name].is_prompt_learning:
             try:
                 # TODO: consider replacing this patching of methods with a more robust mechanism: setting a flag and
                 # letting the underlying methods deal with it, same as how LoRA does it.
@@ -1061,7 +1069,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                 self.prepare_inputs_for_generation = old_prepare_inputs_for_generation
                 self._adapters_disabled = was_disabled
 
-        elif self.peft_config[self.active_adapter].is_adaption_prompt:
+        elif self.peft_config[self._active_adapter_name].is_adaption_prompt:
             try:
                 if not was_disabled:
                     self.base_model.disable_adapter_layers()
@@ -1643,6 +1651,66 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             # handle auxiliary modules
             _set_adapter(self, adapter_name, inference_mode=inference_mode)
 
+    def set_adapters(self, adapter_names: str | Sequence[str], inference_mode: bool = False) -> None:
+        """
+        Transactionally set the active adapter(s).
+
+        In contrast to [`PeftModel.set_adapter`], this method accepts multiple adapter names and activates them
+        atomically: all names are validated *before* any state is mutated. If any name is invalid, a `ValueError` is
+        raised and the previously active adapter(s) -- including their weights and `requires_grad` flags -- are left
+        completely untouched. The same guarantee holds if an error occurs while switching: the previous state is
+        restored, so weights and `requires_grad` are never partially switched.
+
+        Additionally, this function will set the specified adapters to trainable (i.e., requires_grad=True) unless
+        inference_mode is True.
+
+        Args:
+            adapter_names (`str` or `Sequence[str]`):
+                The name(s) of the adapter(s) to be set as active. The adapters must be loaded first.
+            inference_mode (`bool`, optional):
+                Whether the activated adapters should be frozen (i.e. `requires_grad=False`). Default is False.
+        """
+        if isinstance(adapter_names, str):
+            adapter_names = [adapter_names]
+        # deduplicate while preserving order
+        adapter_names = list(dict.fromkeys(adapter_names))
+
+        if not adapter_names:
+            raise ValueError("At least one adapter name must be provided to `set_adapters`.")
+
+        # Validate all names up front so that an invalid name leaves the active adapter set unchanged.
+        invalid_names = [name for name in adapter_names if name not in self.peft_config]
+        if invalid_names:
+            raise ValueError(
+                f"Adapter(s) {invalid_names} not found. The active adapter(s) {self.active_adapters} are left "
+                "unchanged."
+            )
+
+        # A single adapter keeps the exact behavior of the legacy `set_adapter` API.
+        if len(adapter_names) == 1:
+            self.set_adapter(adapter_names[0], inference_mode=inference_mode)
+            return
+
+        if any(self.peft_config[name].is_prompt_learning for name in adapter_names):
+            raise ValueError("Activating multiple adapters at once is not supported for prompt learning methods.")
+
+        # Snapshot the current state so that a failure mid-switch can be rolled back and weights/requires_grad are
+        # never partially switched.
+        previous_active_adapter = self.active_adapter
+        requires_grad_snapshot = {name: param.requires_grad for name, param in self.named_parameters()}
+        try:
+            self.active_adapter = adapter_names
+            self.base_model.set_adapter(adapter_names, inference_mode=inference_mode)
+        except Exception:
+            try:
+                self.base_model.set_adapter(previous_active_adapter)
+            finally:
+                self.active_adapter = previous_active_adapter
+                for name, param in self.named_parameters():
+                    if name in requires_grad_snapshot:
+                        param.requires_grad = requires_grad_snapshot[name]
+            raise
+
     def set_requires_grad(self, adapter_names: str | Sequence[str], requires_grad: bool = True) -> None:
         """
         Enable or disable gradients on the given adapter(s).
@@ -1669,7 +1737,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
 
     @property
     def active_peft_config(self):
-        return self.peft_config[self.active_adapter]
+        return self.peft_config[self._active_adapter_name]
 
     def _adjust_prompt_learning_kwargs(
         self,
