@@ -896,6 +896,133 @@ class LoraLayer(BaseTunerLayer):
 
         return result
 
+    def merge_error_precheck(
+        self,
+        adapter_names: Optional[list[str]] = None,
+        max_merge_error: Optional[float] = None,
+    ) -> dict[str, dict[str, Any]]:
+        """
+        Pre-check the maximum absolute error that merging the LoRA adapter weights would introduce.
+
+        The pre-check is purely diagnostic and read-only: it never modifies the base weights and never changes the
+        merged/unmerged state of the layer. For each adapter, the exact merged weights are computed in float32 and
+        compared against the weights that would actually be stored after casting to the base layer's storage dtype.
+        This simulates the rounding error caused by low-precision (e.g. float16/bfloat16) or quantized storage before
+        the merge is carried out.
+
+        Args:
+            adapter_names (`list[str]`, *optional*):
+                The list of adapter names to check. If `None`, all active adapters are checked.
+            max_merge_error (`float`, *optional*):
+                If given, the pre-check raises a `ValueError` without modifying any weights as soon as the estimated
+                maximum absolute difference exceeds this threshold (or a non-finite value is detected).
+
+        Returns:
+            `dict[str, dict]`: A mapping of adapter name to a dictionary with the following keys:
+                - `max_abs_diff`: maximum absolute difference between the exact and the rounded merged weights
+                - `mean_abs_diff`: mean absolute difference
+                - `base_dtype`: dtype of the base weights
+                - `delta_dtype`: dtype of the adapter (delta) weights
+                - `threshold`: the threshold passed via `max_merge_error` (or `None`)
+                - `exceeded`: whether the threshold was exceeded
+
+        Raises:
+            ValueError: if `max_merge_error` is set and the estimated error exceeds it, or if non-finite values are
+                detected.
+
+        Note:
+            The estimate is most accurate for vanilla LoRA. For LoRA variants (e.g. DoRA) the actual merge applies
+            additional transformations, so the dtype-conversion error estimate is approximate.
+        """
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            return {}
+
+        base_layer = self.get_base_layer()
+        base_weight = dequantize_module_weight(base_layer).detach()
+        base_dtype = base_layer.weight.dtype
+        base_bias = getattr(base_layer, "bias", None)
+        if base_bias is not None:
+            base_bias = base_bias.detach()
+
+        results: dict[str, dict[str, Any]] = {}
+        for active_adapter in adapter_names:
+            if active_adapter not in self.lora_A.keys():
+                continue
+            delta_weight = self.get_delta_weight(active_adapter).detach()
+            delta_dtype = delta_weight.dtype
+            # make sure both tensors live on the same device (e.g. when layers are offloaded)
+            base_weight = base_weight.to(delta_weight.device)
+            if base_bias is not None:
+                base_bias = base_bias.to(delta_weight.device)
+
+            # Exact merged weights in float32 reference
+            merged_exact = base_weight.float() + delta_weight.float()
+
+            # Simulate the merge in the base storage dtype: this is where rounding from low-precision / quantized
+            # storage happens. For floating point storage dtypes we emulate the cast and the addition in that dtype;
+            # for quantized storage we cannot emulate re-quantization, so the dequantized merge is the best estimate.
+            if base_dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+                merged_rounded = (base_weight.to(base_dtype) + delta_weight.to(base_dtype)).float()
+            else:
+                merged_rounded = merged_exact
+
+            diff = (merged_rounded - merged_exact).abs()
+            max_abs_diff = diff.max().item()
+            mean_abs_diff = diff.mean().item()
+
+            if not torch.isfinite(merged_exact).all() or not torch.isfinite(merged_rounded).all():
+                raise ValueError(
+                    f"NaNs or infs detected during the merge error pre-check for adapter {active_adapter!r}. The "
+                    f"adapter weights seem to be broken."
+                )
+
+            result: dict[str, Any] = {
+                "max_abs_diff": max_abs_diff,
+                "mean_abs_diff": mean_abs_diff,
+                "base_dtype": base_dtype,
+                "delta_dtype": delta_dtype,
+                "threshold": max_merge_error,
+                "exceeded": max_merge_error is not None and max_abs_diff > max_merge_error,
+            }
+
+            if self.lora_bias.get(active_adapter, False):
+                if base_bias is None:
+                    raise RuntimeError(
+                        "Impossible to merge LoRA with `lora_bias=True` because the base layer has no bias."
+                    )
+                delta_bias = (self.lora_B[active_adapter].bias * self.scaling[active_adapter]).detach()
+                bias_exact = base_bias.float() + delta_bias.float()
+                if base_dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+                    bias_rounded = (base_bias.to(base_dtype) + delta_bias.to(base_dtype)).float()
+                else:
+                    bias_rounded = bias_exact
+                bias_diff = (bias_rounded - bias_exact).abs()
+                result["bias_max_abs_diff"] = bias_diff.max().item()
+                result["bias_mean_abs_diff"] = bias_diff.mean().item()
+                if not torch.isfinite(bias_exact).all() or not torch.isfinite(bias_rounded).all():
+                    raise ValueError(
+                        f"NaNs or infs detected during the merge error pre-check for adapter {active_adapter!r} "
+                        f"(bias). The adapter weights seem to be broken."
+                    )
+                if max_merge_error is not None and result["bias_max_abs_diff"] > max_merge_error:
+                    result["exceeded"] = True
+
+            results[active_adapter] = result
+
+            if result["exceeded"]:
+                bias_msg = ""
+                if "bias_max_abs_diff" in result:
+                    bias_msg = f" (bias: {result['bias_max_abs_diff']:.6g})"
+                raise ValueError(
+                    f"LoRA merge error pre-check failed for adapter {active_adapter!r}: the estimated maximum "
+                    f"absolute difference is {max_abs_diff:.6g}{bias_msg}, which exceeds the threshold of "
+                    f"{max_merge_error:.6g}. The base weights were not modified and the layer remains unmerged. "
+                    f"Either merge with a higher threshold or merge in higher precision (e.g. float32)."
+                )
+
+        return results
+
 
 # Below code is based on https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
 # and modified to work with PyTorch FSDP
@@ -949,7 +1076,12 @@ class Linear(nn.Module, LoraLayer):
             ("kasa_config",): variants.KasaLinearVariant,
         }
 
-    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+    def merge(
+        self,
+        safe_merge: bool = False,
+        adapter_names: Optional[list[str]] = None,
+        max_merge_error: Optional[float] = None,
+    ) -> None:
         """
         Merge the active adapter weights into the base weights
 
@@ -961,11 +1093,21 @@ class Linear(nn.Module, LoraLayer):
             adapter_names (`list[str]`, *optional*):
                 The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
                 to `None`.
+            max_merge_error (`float`, *optional*):
+                If given, a merge error pre-check is performed before merging: the merge is rejected, without
+                modifying the base weights, if the estimated maximum absolute difference from low-precision or
+                quantized merging exceeds this threshold. The layer stays unmerged and thus reversible. See
+                [`LoraLayer.merge_error_precheck`] for details. Defaults to `None`.
         """
         adapter_names = check_adapters_to_merge(self, adapter_names)
         if not adapter_names:
             # no adapter to merge
             return
+
+        if max_merge_error is not None:
+            # Pre-check the merge error before touching any weights. Raises without modifying weights if the
+            # threshold is exceeded.
+            self.merge_error_precheck(adapter_names=adapter_names, max_merge_error=max_merge_error)
 
         for active_adapter in adapter_names:
             if active_adapter in self.lora_A.keys():
