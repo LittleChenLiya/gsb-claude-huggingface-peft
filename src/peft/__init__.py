@@ -33,7 +33,7 @@ from .mapping import (
     get_peft_config,
     inject_adapter_in_model,
 )
-from .mapping_func import get_peft_model
+from .mapping_func import AdapterTypeSelection, explain_adapter_type_selection, get_peft_model
 from .mixed_model import PeftMixedModel
 from .peft_model import (
     PeftModel,
@@ -191,6 +191,7 @@ __all__ = [
     "AdaLoraModel",
     "AdamssConfig",
     "AdamssModel",
+    "AdapterTypeSelection",
     "AdaptionPromptConfig",
     "AdaptionPromptModel",
     "ArrowConfig",
@@ -315,6 +316,7 @@ __all__ = [
     "compose_cartridge_adapters",
     "convert_to_lora",
     "create_arrow_model",
+    "explain_adapter_type_selection",
     "find_kappa_target_modules",
     "get_base_model_state_dict",
     "get_eva_state_dict",
