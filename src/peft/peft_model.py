@@ -1643,6 +1643,88 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             # handle auxiliary modules
             _set_adapter(self, adapter_name, inference_mode=inference_mode)
 
+    def set_adapters(self, adapter_names: str | Sequence[str], inference_mode: bool = False) -> None:
+        """
+        Transactionally set the active adapter(s).
+
+        All adapter names are validated before any state is changed. If any name is invalid, the previously
+        active adapter set is kept unchanged. If the switch fails midway, the previous state is restored so
+        that neither the active adapter weights nor the `requires_grad` flags are partially switched.
+
+        Use [`PeftModel.set_adapter`] to switch a single adapter.
+
+        Args:
+            adapter_name (`str` or `Sequence[str]`):
+                The name(s) of the adapter(s) to set as active. All adapters must be loaded first.
+            inference_mode (`bool`, optional):
+                Whether the activated adapters should be frozen (i.e. `requires_grad=False`). Default is False.
+        """
+        if isinstance(adapter_names, str):
+            adapter_names = [adapter_names]
+        adapter_names = list(adapter_names)
+
+        if not adapter_names:
+            raise ValueError("At least one adapter name must be provided to `set_adapters`.")
+
+        # Validate every name before mutating anything: an invalid name must not result in a partially
+        # switched active adapter set.
+        available_adapters = list(self.peft_config.keys())
+        invalid_adapters = [name for name in adapter_names if name not in self.peft_config]
+        if invalid_adapters:
+            raise ValueError(
+                f"Adapter(s) {invalid_adapters} not found. Available adapters: {available_adapters}. "
+                "The active adapter set was not changed."
+            )
+
+        # Snapshot the previous state so that a failed switch can be rolled back fully: the active adapter
+        # selection (which weights participate in the forward pass) and the requires_grad flags must never
+        # be partially switched.
+        snapshot = self._snapshot_adapter_state()
+        previous_active_adapter = self.active_adapter
+        previous_base_active_adapter = getattr(self.base_model, "active_adapter", None)
+        try:
+            self.active_adapter = adapter_names[0]
+            if self.peft_config[adapter_names[0]].is_prompt_learning:
+                # handle auxiliary modules
+                _set_adapter(self, adapter_names, inference_mode=inference_mode)
+            else:
+                self.base_model.set_adapter(adapter_names, inference_mode=inference_mode)
+        except Exception:
+            self._restore_adapter_state(snapshot, previous_active_adapter, previous_base_active_adapter)
+            raise
+
+    def _snapshot_adapter_state(self) -> list[tuple[torch.nn.Module, str | list[str], list[tuple[torch.nn.Parameter, bool]]]]:
+        """Snapshot the active adapter selection and requires_grad flags of all adapter modules.
+
+        This is used to roll back a failed adapter switch so that the active adapter weights and the
+        requires_grad flags are not partially switched.
+        """
+        snapshots = []
+        for module in self.modules():
+            if isinstance(module, (BaseTunerLayer, AuxiliaryTrainingWrapper)):
+                active_adapter = module._active_adapter
+                active_adapter_copy = active_adapter[:] if isinstance(active_adapter, list) else active_adapter
+                requires_grad = [
+                    (param, param.requires_grad) for param in module.parameters() if param.is_leaf
+                ]
+                snapshots.append((module, active_adapter_copy, requires_grad))
+        return snapshots
+
+    def _restore_adapter_state(
+        self,
+        snapshots: list[tuple[torch.nn.Module, str | list[str], list[tuple[torch.nn.Parameter, bool]]]],
+        active_adapter: str | list[str],
+        base_active_adapter: str | list[str] | None,
+    ) -> None:
+        """Restore a previously taken adapter state snapshot."""
+        for module, active_adapter_state, requires_grad_state in snapshots:
+            module._active_adapter = active_adapter_state
+            for param, requires_grad in requires_grad_state:
+                param.requires_grad_(requires_grad)
+        self.active_adapter = active_adapter
+        if base_active_adapter is not None:
+            self.base_model.active_adapter = base_active_adapter
+
     def set_requires_grad(self, adapter_names: str | Sequence[str], requires_grad: bool = True) -> None:
         """
         Enable or disable gradients on the given adapter(s).

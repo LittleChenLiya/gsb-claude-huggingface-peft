@@ -2063,6 +2063,15 @@ class BaseTunerLayer(ABC):
         if isinstance(adapter_names, str):
             adapter_names = [adapter_names]
 
+        # Validate before mutating: an invalid adapter name must not result in a partially switched state
+        # (requires_grad flags toggled but the active adapter set to an unknown name).
+        available_adapters = self._all_available_adapter_names()
+        invalid_adapters = [name for name in adapter_names if name not in available_adapters]
+        if invalid_adapters:
+            raise ValueError(
+                f"Adapter(s) {invalid_adapters} not found. Available adapters: {sorted(available_adapters)}."
+            )
+
         # Deactivate grads on the inactive adapter and activate grads on the active adapter (if not in inference mode)
         for layer_name in self.adapter_layer_names:
             module_dict = getattr(self, layer_name)
