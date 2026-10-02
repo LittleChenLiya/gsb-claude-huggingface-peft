@@ -102,6 +102,75 @@ if TYPE_CHECKING:
     ) -> PeftModel | PeftMixedModel: ...
 
 
+def _get_peft_model_wrapper_class(peft_config: PeftConfig, mixed: bool = False) -> type[PeftModel | PeftMixedModel]:
+    """
+    Return the PEFT model wrapper class that [`get_peft_model`] would select for the given config.
+
+    This is a pure lookup: it neither instantiates a model nor modifies the config. Unknown PEFT types raise a
+    readable `ValueError` instead of an opaque `KeyError` further down the stack.
+    """
+    peft_type = peft_config.peft_type
+    if peft_type not in PEFT_TYPE_TO_CONFIG_MAPPING:
+        known_types = ", ".join(sorted(str(t) for t in PEFT_TYPE_TO_CONFIG_MAPPING))
+        raise ValueError(
+            f"Unknown PEFT type: {peft_type!r}. Cannot determine the PEFT model wrapper for this config. "
+            f"Known PEFT types are: {known_types}."
+        )
+
+    if mixed:
+        return PeftMixedModel
+
+    # We explicitly exclude prompt learning here since prompt learning is specific to the task and needs special
+    # handling in the PEFT model's forward method.
+    if peft_config.task_type not in MODEL_TYPE_TO_PEFT_MODEL_MAPPING.keys() and not peft_config.is_prompt_learning:
+        return PeftModel
+
+    return MODEL_TYPE_TO_PEFT_MODEL_MAPPING[peft_config.task_type]
+
+
+def explain_adapter_type_selection(peft_config: PeftConfig, mixed: bool = False) -> str:
+    """
+    Explain which PEFT model wrapper class a config maps to when passed to [`get_peft_model`].
+
+    This is a pure explanation helper: it does not instantiate a model and it does not modify the config. If the
+    config's `peft_type` is unknown, a readable `ValueError` is raised.
+
+    Args:
+        peft_config ([`PeftConfig`]):
+            Configuration object containing the parameters of the Peft model.
+        mixed (`bool`, `optional`, defaults to `False`):
+            Whether the explanation should assume adapter mixing, mirroring the `mixed` argument of
+            [`get_peft_model`].
+
+    Returns:
+        `str`: A human-readable explanation of the adapter type selection.
+
+    Example:
+
+    ```python
+    >>> from peft import LoraConfig, explain_adapter_type_selection
+
+    >>> config = LoraConfig(task_type="CAUSAL_LM")
+    >>> print(explain_adapter_type_selection(config))
+    PEFT type <PeftType.LORA: 'LORA'> (task_type='CAUSAL_LM') maps to PeftModelForCausalLM: ...
+    ```
+    """
+    wrapper_cls = _get_peft_model_wrapper_class(peft_config, mixed=mixed)
+    peft_type = peft_config.peft_type
+    task_type = peft_config.task_type
+
+    if mixed:
+        reason = "mixed=True was passed, so (compatible) adapters are combined in a PeftMixedModel"
+    elif task_type in MODEL_TYPE_TO_PEFT_MODEL_MAPPING:
+        reason = f"task_type={task_type!r} has a dedicated task-specific wrapper"
+    elif peft_config.is_prompt_learning:
+        reason = "it is a prompt learning config, which is handled by the task-specific wrapper for its task_type"
+    else:
+        reason = "no task_type-specific wrapper applies, so the generic PeftModel wrapper is used"
+
+    return f"PEFT type {peft_type!r} (task_type={task_type!r}) maps to {wrapper_cls.__name__}: {reason}."
+
+
 def get_peft_model(
     model: nn.Module,
     peft_config: PeftConfig,
@@ -180,22 +249,13 @@ def get_peft_model(
             "This may lead to reinitialization of the adapter weights during loading."
         )
 
-    if mixed:
+    model_cls = _get_peft_model_wrapper_class(peft_config, mixed=mixed)
+
+    if model_cls is PeftMixedModel:
         # note: PeftMixedModel does not support autocast_adapter_dtype, so don't pass it
         return PeftMixedModel(model, peft_config, adapter_name=adapter_name)
 
-    # We explicitly exclude prompt learning here since prompt learning is specific to the task and needs special
-    # handling in the PEFT model's forward method.
-    if peft_config.task_type not in MODEL_TYPE_TO_PEFT_MODEL_MAPPING.keys() and not peft_config.is_prompt_learning:
-        return PeftModel(
-            model,
-            peft_config,
-            adapter_name=adapter_name,
-            autocast_adapter_dtype=autocast_adapter_dtype,
-            low_cpu_mem_usage=low_cpu_mem_usage,
-        )
-
-    return MODEL_TYPE_TO_PEFT_MODEL_MAPPING[peft_config.task_type](
+    return model_cls(
         model,
         peft_config,
         adapter_name=adapter_name,
