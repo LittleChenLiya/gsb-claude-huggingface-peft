@@ -45,6 +45,17 @@ from .peft_types import PeftType
 from .warning import PeftWarning
 
 
+#: Report returned by :func:`check_peft_model_state_dict`, describing how an adapter checkpoint relates to the model
+#: *before* any weight is loaded:
+#:
+#: - ``missing_keys``: adapter weights the model expects (for the given adapter) that are absent from the checkpoint.
+#: - ``unexpected_keys``: checkpoint keys that correspond to no model parameter and would be silently dropped.
+#: - ``mismatched_keys``: ``(key, checkpoint_shape, model_shape)`` tuples for keys whose shapes disagree.
+#:
+#: Keys are reported in the model's (load-time) key format, e.g. ``base_model.model.lin1.lora_A.default.weight``.
+AdapterLoadReport = namedtuple("AdapterLoadReport", ["missing_keys", "unexpected_keys", "mismatched_keys"])
+
+
 def _validate_lora_adapter_state_dict(
     state_dict: dict[str, torch.Tensor],
     adapter_name: str = "default",
@@ -354,12 +365,13 @@ def get_peft_model_state_dict(
     return to_return
 
 
-def _find_mismatched_keys(
-    model: torch.nn.Module, peft_model_state_dict: dict[str, torch.Tensor], ignore_mismatched_sizes: bool = False
-) -> tuple[dict[str, torch.Tensor], list[tuple[str, tuple[int, ...], tuple[int, ...]]]]:
-    if not ignore_mismatched_sizes:
-        return peft_model_state_dict, []
+def _collect_mismatched_keys(
+    model: torch.nn.Module, peft_model_state_dict: dict[str, torch.Tensor]
+) -> list[tuple[str, tuple[int, ...], tuple[int, ...]]]:
+    """Return ``(key, checkpoint_shape, model_shape)`` tuples for keys whose shapes disagree with the model.
 
+    Keys absent from the model are not considered here (they are unexpected keys, not mismatched ones).
+    """
     mismatched = []
     state_dict = model.state_dict()
     for key, tensor in peft_model_state_dict.items():
@@ -379,6 +391,17 @@ def _find_mismatched_keys(
 
         if state_dict[key].shape != tensor.shape:
             mismatched.append((key, tensor.shape, state_dict[key].shape))
+
+    return mismatched
+
+
+def _find_mismatched_keys(
+    model: torch.nn.Module, peft_model_state_dict: dict[str, torch.Tensor], ignore_mismatched_sizes: bool = False
+) -> tuple[dict[str, torch.Tensor], list[tuple[str, tuple[int, ...], tuple[int, ...]]]]:
+    if not ignore_mismatched_sizes:
+        return peft_model_state_dict, []
+
+    mismatched = _collect_mismatched_keys(model, peft_model_state_dict)
 
     for key, _, _ in mismatched:
         del peft_model_state_dict[key]
@@ -546,39 +569,15 @@ def _maybe_shard_state_dict_for_tp(model, state_dict, adapter_name):
         state_dict[key] = sharded
 
 
-def set_peft_model_state_dict(
-    model,
-    peft_model_state_dict,
-    adapter_name="default",
-    ignore_mismatched_sizes: bool = False,
-    low_cpu_mem_usage: bool = False,
-) -> namedtuple:
-    """
-    Set the state dict of the PEFT model.
+def _prepare_peft_model_state_dict_for_load(
+    model, peft_model_state_dict: dict[str, torch.Tensor], adapter_name: str = "default"
+) -> dict[str, torch.Tensor]:
+    """Remap a saved adapter state dict (as returned by [`get_peft_model_state_dict`]) into the model's key format.
 
-    Given a PEFT `state_dict` (as returned by [`get_peft_model_state_dict`]), insert the weights into the model. The
-    model needs to have the PEFT adapters already in place (e.g. via [`inject_adapter_in_model`]).
-
-    Setting the adapter weights also takes care of re-inserting the adapter name. This name may be a different name
-    than the one originally used to train the adapter.
-
-    Args:
-        model ([`PeftModel`]):
-            The Peft model.
-        peft_model_state_dict (`dict`):
-            The state dict of the Peft model.
-        adapter_name (`str`, *optional*, defaults to `"default"`):
-            The name of the adapter whose state dict should be set.
-        ignore_mismatched_sizes (`bool`, *optional*, defaults to `False`):
-            Whether to ignore mismatched sizes in the state dict.
-        low_cpu_mem_usage (`bool`, `optional`, defaults to `False`):
-            This argument must be `True` if the `model` was loaded with adapter weights on the meta device, e.g. after
-            calling `inject_adapter_in_model` with `low_cpu_mem_usage=True`. Otherwise, leave it as `False`.
-
-    Returns:
-        load_result (`_IncompatibleKeys`)
-            A named tuple with `missing_keys` and `unexpected_keys` fields.
-
+    This performs all key-level transformations that loading requires - transformers weight conversion, auxiliary
+    training wrapper key translation, tuner-specific remapping, and adapter-name insertion - without touching the
+    model's weights. The returned state dict can be diffed against ``model.state_dict()`` (preflight report) or loaded
+    into the model.
     """
     config = model.peft_config[adapter_name]
     state_dict = peft_model_state_dict.copy()
@@ -614,6 +613,11 @@ def set_peft_model_state_dict(
                 lookup_key = f"{name}.{k}"
                 store_key = f"{name}.{key_map[k]}"
 
+                if lookup_key not in peft_model_state_dict:
+                    # Tolerate checkpoints that don't contain this key: it is reported as missing downstream (or
+                    # skipped in non-strict loading) instead of raising a bare KeyError here.
+                    continue
+
                 state_dict[store_key] = peft_model_state_dict[lookup_key]
 
                 # Delete the saved key after translating it to the wrapper's load key.
@@ -633,6 +637,129 @@ def set_peft_model_state_dict(
     requires_prefix = any(n.startswith(prefix) for n, _ in model.named_parameters())
     if not requires_prefix:
         peft_model_state_dict = {k.removeprefix(prefix): v for k, v in peft_model_state_dict.items()}
+
+    return peft_model_state_dict
+
+
+def _compute_adapter_load_report(
+    model,
+    prepared_state_dict: dict[str, torch.Tensor],
+    adapter_name: str = "default",
+) -> AdapterLoadReport:
+    """Build an [`AdapterLoadReport`] from an already load-format adapter state dict (see
+    [`_prepare_peft_model_state_dict_for_load`]).
+
+    The expected adapter keys are derived from the model itself via [`get_peft_model_state_dict`], so "missing" means
+    "adapter weights the model needs that the checkpoint does not provide" rather than "any model weight not covered
+    by the checkpoint" (which would list every base model weight).
+    """
+    expected_state_dict = get_peft_model_state_dict(model, adapter_name=adapter_name)
+    prepared_expected = _prepare_peft_model_state_dict_for_load(model, expected_state_dict, adapter_name)
+
+    model_state_dict = model.state_dict()
+    missing_keys = [key for key in prepared_expected if key not in prepared_state_dict]
+    unexpected_keys = [
+        key for key in prepared_state_dict if key not in model_state_dict and key not in prepared_expected
+    ]
+    mismatched_keys = _collect_mismatched_keys(model, prepared_state_dict)
+    return AdapterLoadReport(
+        missing_keys=missing_keys, unexpected_keys=unexpected_keys, mismatched_keys=mismatched_keys
+    )
+
+
+def check_peft_model_state_dict(
+    model,
+    peft_model_state_dict: dict[str, torch.Tensor],
+    adapter_name: str = "default",
+) -> AdapterLoadReport:
+    """Preflight-check an adapter state dict against the model *before* loading any weight.
+
+    Given a PEFT `state_dict` (as returned by [`get_peft_model_state_dict`] or [`load_peft_weights`]), compute which
+    adapter weights are missing, which checkpoint keys are unexpected, and which keys have mismatched shapes. The
+    model is not modified in any way; use the report to decide whether to proceed with
+    [`set_peft_model_state_dict`] (possibly with ``strict=True`` to fail atomically on any of these problems).
+
+    Args:
+        model ([`PeftModel`]):
+            The Peft model, with the PEFT adapters already in place.
+        peft_model_state_dict (`dict`):
+            The state dict of the Peft model, in saved (adapter-name-free) key format.
+        adapter_name (`str`, *optional*, defaults to `"default"`):
+            The name of the adapter whose state dict should be checked.
+
+    Returns:
+        report ([`AdapterLoadReport`]):
+            A named tuple with `missing_keys`, `unexpected_keys` and `mismatched_keys` fields. Keys are reported in
+            the model's (load-time) key format. `mismatched_keys` contains `(key, checkpoint_shape, model_shape)`
+            tuples.
+    """
+    prepared_state_dict = _prepare_peft_model_state_dict_for_load(model, peft_model_state_dict, adapter_name)
+    return _compute_adapter_load_report(model, prepared_state_dict, adapter_name)
+
+
+def set_peft_model_state_dict(
+    model,
+    peft_model_state_dict,
+    adapter_name="default",
+    ignore_mismatched_sizes: bool = False,
+    low_cpu_mem_usage: bool = False,
+    strict: bool = False,
+) -> namedtuple:
+    """
+    Set the state dict of the PEFT model.
+
+    Given a PEFT `state_dict` (as returned by [`get_peft_model_state_dict`]), insert the weights into the model. The
+    model needs to have the PEFT adapters already in place (e.g. via [`inject_adapter_in_model`]).
+
+    Setting the adapter weights also takes care of re-inserting the adapter name. This name may be a different name
+    than the one originally used to train the adapter.
+
+    Args:
+        model ([`PeftModel`]):
+            The Peft model.
+        peft_model_state_dict (`dict`):
+            The state dict of the Peft model.
+        adapter_name (`str`, *optional*, defaults to `"default"`):
+            The name of the adapter whose state dict should be set.
+        ignore_mismatched_sizes (`bool`, *optional*, defaults to `False`):
+            Whether to ignore mismatched sizes in the state dict.
+        low_cpu_mem_usage (`bool`, `optional`, defaults to `False`):
+            This argument must be `True` if the `model` was loaded with adapter weights on the meta device, e.g. after
+            calling `inject_adapter_in_model` with `low_cpu_mem_usage=True`. Otherwise, leave it as `False`.
+        strict (`bool`, *optional*, defaults to `False`):
+            Whether to strictly enforce that the checkpoint matches the adapter weights of the model. If `True`, a
+            preflight report (see [`check_peft_model_state_dict`]) is computed *before* loading and a `RuntimeError`
+            is raised on any missing key, unexpected key, or - unless `ignore_mismatched_sizes=True` - mismatched
+            shape. In that case no weight is modified at all (no partial write). If `False` (default), the historical
+            tolerant behavior is kept: loadable weights are loaded and problems are only reported via the return
+            value / warnings.
+
+    Returns:
+        load_result (`_IncompatibleKeys`)
+            A named tuple with `missing_keys` and `unexpected_keys` fields.
+
+    """
+    config = model.peft_config[adapter_name]
+    peft_model_state_dict = _prepare_peft_model_state_dict_for_load(model, peft_model_state_dict, adapter_name)
+
+    if strict:
+        report = _compute_adapter_load_report(model, peft_model_state_dict, adapter_name)
+        error_msgs = []
+        if report.missing_keys:
+            error_msgs.append(f"Missing key(s) in state_dict: {report.missing_keys}")
+        if report.unexpected_keys:
+            error_msgs.append(f"Unexpected key(s) in state_dict: {report.unexpected_keys}")
+        if report.mismatched_keys and not ignore_mismatched_sizes:
+            mismatched_msg = ", ".join(
+                f"{key}: checkpoint shape {shape1} vs model shape {shape2}"
+                for key, shape1, shape2 in report.mismatched_keys
+            )
+            error_msgs.append(f"Size mismatch(es) in state_dict: {mismatched_msg}")
+        if error_msgs:
+            raise RuntimeError(
+                f"Error(s) in loading state_dict for adapter '{adapter_name}' (strict=True, no weights were "
+                "modified):\n\t" + "\n\t".join(error_msgs)
+            )
 
     peft_model_state_dict, mismatched_keys = _find_mismatched_keys(
         model, peft_model_state_dict, ignore_mismatched_sizes=ignore_mismatched_sizes

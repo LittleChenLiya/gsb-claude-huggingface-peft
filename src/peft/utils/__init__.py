@@ -81,6 +81,7 @@ from .other import (
 from .peft_types import PeftType, TaskType, register_peft_method
 from .quantization_utils import get_quantization_kwargs, quantization_extra_repr, resolve_quantization_backend
 from .save_and_load import (
+    check_peft_model_state_dict,
     get_base_model_state_dict,
     get_peft_model_state_dict,
     load_peft_weights,
@@ -150,6 +151,7 @@ __all__ = [
     "_set_trainable",
     "bloom_model_postprocess_past_key_value",
     "cast_mixed_precision_params",
+    "check_peft_model_state_dict",
     "get_base_model_state_dict",
     "get_gptqmodel_quant_linear",
     "get_peft_model_state_dict",
