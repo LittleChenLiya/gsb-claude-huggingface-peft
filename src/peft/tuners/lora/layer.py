@@ -34,7 +34,7 @@ from peft.tuners.tuners_utils import (
     _get_in_out_features,
     check_adapters_to_merge,
 )
-from peft.utils import ALLOWED_COMPUTE_DTYPES, UPCAST_DTYPES
+from peft.utils import ALLOWED_COMPUTE_DTYPES, UPCAST_DTYPES, MergePrecheckError
 from peft.utils.integrations import (
     dequantize_module_weight,
     gather_params_ctx,
@@ -215,6 +215,82 @@ class LoraLayer(BaseTunerLayer):
         # return the found variant or None for vanilla LoRA
         variant_class = lora_variant_mapping[requested_keys]
         return variant_class() if variant_class else None
+
+    def _precheck_base_weight(self) -> torch.Tensor:
+        """Return the base weight that the LoRA delta would be merged into (used by the merge error pre-check)."""
+        return self.get_base_layer().weight
+
+    def precheck_merge_error(
+        self,
+        adapter_names: Optional[list[str]] = None,
+        target_dtype: Optional[torch.dtype] = None,
+    ) -> dict[str, float]:
+        """
+        Estimate, for each adapter, the maximum absolute error that merging would introduce through quantization or
+        dtype conversion of the merged weights.
+
+        The estimate is computed as the maximum absolute difference between the merged weights computed in float32
+        and the same merged weights after a round-trip through `target_dtype` (which defaults to the dtype of the
+        base weight). This is a pure pre-check: it does not modify the base weights, the adapter weights, or the
+        merge state of the layer in any way.
+
+        Args:
+            adapter_names (`list[str]`, *optional*):
+                The list of adapter names that should be checked. If None, all active adapters are checked. Defaults
+                to `None`.
+            target_dtype (`torch.dtype`, *optional*):
+                The floating point dtype that the merged weights would be converted to, e.g. `torch.float16` to
+                simulate a low-precision merge. If None, the dtype of the base weight is used. Defaults to `None`.
+
+        Returns:
+            `dict[str, float]`: A mapping from adapter name to the estimated maximum absolute error.
+        """
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        errors: dict[str, float] = {}
+        for active_adapter in adapter_names:
+            if active_adapter not in self.lora_A.keys() and active_adapter not in self.lora_embedding_A.keys():
+                continue
+            if active_adapter in self.lora_variant:
+                raise ValueError(
+                    "The merge error pre-check only supports vanilla LoRA adapters, but adapter "
+                    f"'{active_adapter}' uses a LoRA variant."
+                )
+            base_weight = self._precheck_base_weight()
+            if not base_weight.dtype.is_floating_point:
+                # e.g. quantized (bitsandbytes) base weights: estimate the error against the dequantized weights
+                base_weight = dequantize_module_weight(self.get_base_layer())
+            dtype = target_dtype if target_dtype is not None else base_weight.dtype
+            if not dtype.is_floating_point:
+                raise ValueError(f"target_dtype must be a floating point dtype, got {dtype}.")
+            base_fp32 = base_weight.detach().to(torch.float32)
+            delta_fp32 = self.get_delta_weight(active_adapter).to(torch.float32)
+            merged_fp32 = base_fp32 + delta_fp32
+            merged_roundtrip = merged_fp32.to(dtype).to(torch.float32)
+            errors[active_adapter] = (merged_roundtrip - merged_fp32).abs().max().item()
+        return errors
+
+    def _check_merge_error_tolerance(
+        self,
+        adapter_names: list[str],
+        merge_error_tolerance: float,
+        target_dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        """
+        Run the merge error pre-check and raise a `MergePrecheckError` if the estimated error of any adapter exceeds
+        `merge_error_tolerance`.
+
+        This must be called *before* any weight is modified, so that a failed check leaves the layer in its
+        unmerged (reversible) state.
+        """
+        errors = self.precheck_merge_error(adapter_names=adapter_names, target_dtype=target_dtype)
+        for active_adapter, error in errors.items():
+            if error > merge_error_tolerance:
+                raise MergePrecheckError(
+                    f"Merging adapter '{active_adapter}' into {self.__class__.__name__} is rejected: the estimated "
+                    f"maximum absolute merge error ({error:.3e}) exceeds the tolerance "
+                    f"({merge_error_tolerance:.3e}). The base weights were not modified and the layer remains "
+                    "unmerged."
+                )
 
     def update_layer(
         self,
@@ -949,7 +1025,12 @@ class Linear(nn.Module, LoraLayer):
             ("kasa_config",): variants.KasaLinearVariant,
         }
 
-    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+    def merge(
+        self,
+        safe_merge: bool = False,
+        adapter_names: Optional[list[str]] = None,
+        merge_error_tolerance: Optional[float] = None,
+    ) -> None:
         """
         Merge the active adapter weights into the base weights
 
@@ -961,11 +1042,20 @@ class Linear(nn.Module, LoraLayer):
             adapter_names (`list[str]`, *optional*):
                 The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
                 to `None`.
+            merge_error_tolerance (`float`, *optional*):
+                If set, a merge error pre-check is run before merging: the maximum absolute error that
+                quantization or dtype conversion of the merged weights would introduce is estimated and, if it
+                exceeds this tolerance, a `MergePrecheckError` is raised and the merge is rejected. The check
+                runs before any weight is modified, so a rejected merge leaves the layer in its unmerged
+                (reversible) state. Defaults to `None` (no pre-check).
         """
         adapter_names = check_adapters_to_merge(self, adapter_names)
         if not adapter_names:
             # no adapter to merge
             return
+        if merge_error_tolerance is not None:
+            # the pre-check runs before any weight is modified, keeping the layer reversible on failure
+            self._check_merge_error_tolerance(adapter_names, merge_error_tolerance)
 
         for active_adapter in adapter_names:
             if active_adapter in self.lora_A.keys():
@@ -1329,7 +1419,12 @@ class Embedding(nn.Module, LoraLayer):
         self.lora_embedding_B[adapter_name].data = lora_embedding_B.to(dtype)
         self.lora_embedding_A[adapter_name].data = lora_embedding_A.to(dtype)
 
-    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+    def merge(
+        self,
+        safe_merge: bool = False,
+        adapter_names: Optional[list[str]] = None,
+        merge_error_tolerance: Optional[float] = None,
+    ) -> None:
         """
         Merge the active adapter weights into the base weights
 
@@ -1341,11 +1436,20 @@ class Embedding(nn.Module, LoraLayer):
             adapter_names (`list[str]`, *optional*):
                 The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
                 to `None`.
+            merge_error_tolerance (`float`, *optional*):
+                If set, a merge error pre-check is run before merging: the maximum absolute error that
+                quantization or dtype conversion of the merged weights would introduce is estimated and, if it
+                exceeds this tolerance, a `MergePrecheckError` is raised and the merge is rejected. The check
+                runs before any weight is modified, so a rejected merge leaves the layer in its unmerged
+                (reversible) state. Defaults to `None` (no pre-check).
         """
         adapter_names = check_adapters_to_merge(self, adapter_names)
         if not adapter_names:
             # no adapter to merge
             return
+        if merge_error_tolerance is not None:
+            # the pre-check runs before any weight is modified, keeping the layer reversible on failure
+            self._check_merge_error_tolerance(adapter_names, merge_error_tolerance)
 
         for active_adapter in adapter_names:
             if active_adapter in self.lora_embedding_A.keys():
@@ -1667,7 +1771,12 @@ class _ConvNd(nn.Module, LoraLayer):
     def _get_dora_factor_view(self):
         return (-1,) + (1,) * (self._kernel_dim - 1)
 
-    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+    def merge(
+        self,
+        safe_merge: bool = False,
+        adapter_names: Optional[list[str]] = None,
+        merge_error_tolerance: Optional[float] = None,
+    ) -> None:
         """
         Merge the active adapter weights inside the base weights
 
@@ -1679,11 +1788,20 @@ class _ConvNd(nn.Module, LoraLayer):
             adapter_names (`list[str]`, *optional*):
                 The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
                 to `None`.
+            merge_error_tolerance (`float`, *optional*):
+                If set, a merge error pre-check is run before merging: the maximum absolute error that
+                quantization or dtype conversion of the merged weights would introduce is estimated and, if it
+                exceeds this tolerance, a `MergePrecheckError` is raised and the merge is rejected. The check
+                runs before any weight is modified, so a rejected merge leaves the layer in its unmerged
+                (reversible) state. Defaults to `None` (no pre-check).
         """
         adapter_names = check_adapters_to_merge(self, adapter_names)
         if not adapter_names:
             # no adapter to merge
             return
+        if merge_error_tolerance is not None:
+            # the pre-check runs before any weight is modified, keeping the layer reversible on failure
+            self._check_merge_error_tolerance(adapter_names, merge_error_tolerance)
 
         for active_adapter in adapter_names:
             if active_adapter in self.lora_A.keys():
@@ -2552,6 +2670,10 @@ class ParamWrapper(nn.Module, LoraLayer):
         param = self.get_param()
         return lhs.to(param.dtype), rhs.to(param.dtype), self.scaling[adapter_name]
 
+    def _precheck_base_weight(self) -> torch.Tensor:
+        # ParamWrapper wraps an arbitrary parameter, not necessarily `weight`
+        return getattr(self.get_base_layer(), self.parameter_name)
+
     def get_delta_weight(self, adapter_name, *args, **kwargs):
         if self.num_experts == 1:
             # could actually be a normal layer or experts stacked block-diagonally, acting like a single layer
@@ -2643,12 +2765,20 @@ class ParamWrapper(nn.Module, LoraLayer):
                 "https://github.com/huggingface/peft/issues and report this warning."
             )
 
-    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+    def merge(
+        self,
+        safe_merge: bool = False,
+        adapter_names: Optional[list[str]] = None,
+        merge_error_tolerance: Optional[float] = None,
+    ) -> None:
         # same as lora.Linear.merge but not hard-coding base_layer.weight and without special cases like variants removed
         adapter_names = check_adapters_to_merge(self, adapter_names)
         if not adapter_names:
             # no adapter to merge
             return
+        if merge_error_tolerance is not None:
+            # the pre-check runs before any weight is modified, keeping the layer reversible on failure
+            self._check_merge_error_tolerance(adapter_names, merge_error_tolerance)
 
         for active_adapter in adapter_names:
             if active_adapter in self.lora_A.keys():

@@ -163,6 +163,7 @@ from .tuners.cartridge.utils import (
 )
 from .utils import (
     TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING,
+    MergePrecheckError,
     NoMatchingPeftModuleError,
     PeftError,
     PeftType,
@@ -245,6 +246,7 @@ __all__ = [
     "LoraGAConfig",
     "LoraModel",
     "LoraRuntimeConfig",
+    "MergePrecheckError",
     "MissConfig",
     "MissModel",
     "MontecloraConfig",

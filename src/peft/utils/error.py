@@ -25,3 +25,13 @@ class NoMatchingPeftModuleError(PeftError, ValueError):
     error raised previously. Code that adds such an adapter intentionally can catch this error (or `PeftError`) and
     proceed.
     """
+
+
+class MergePrecheckError(PeftError, ValueError):
+    """The merge error pre-check rejected a LoRA merge.
+
+    Raised when the estimated maximum absolute error that a merge would introduce (e.g. through quantization or
+    dtype conversion of the merged weights) exceeds the user-provided tolerance. The error is raised *before* any
+    base weight is modified, so the layer is left in its unmerged, reversible state. It subclasses `ValueError` so
+    that existing code catching `ValueError` keeps working.
+    """
